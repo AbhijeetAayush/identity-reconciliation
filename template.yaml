@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Identity Reconciliation Service with Node.js and TypeScript
+
+Parameters:
+  DatabaseName:
+    Type: String
+    Default: identity_db
+  RedisNodeType:
+    Type: String
+    Default: cache.t3.micro
+  AuroraInstanceType:
+    Type: String
+    Default: db.serverless
+
+Resources:
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'POST,OPTIONS'"
+        AllowHeaders: "'Content-Type'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: NONE
+
+  # API Handler Lambda
+  IdentifyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/identify/
+      Handler: dist/app.handler
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          REDIS_ENDPOINT: !GetAtt RedisCluster.PrimaryEndPoint.Address
+          DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          DB_NAME: !Ref DatabaseName
+          DB_USER: postgres
+          DB_PASSWORD: your-secure-password # Replace with strong password
+          SQS_QUEUE_URL: !Ref ReconciliationQueue
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - rds-data:ExecuteStatement
+                - elasticache:DescribeCacheClusters
+                - sqs:SendMessage
+              Resource: '*'
+      Events:
+        IdentifyApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /identify
+            Method: POST
+
+  # Worker Lambda
+  ReconciliationWorker:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/reconciliation/
+      Handler: dist/app.handler
+      Runtime: nodejs18.x
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          REDIS_ENDPOINT: !GetAtt RedisCluster.PrimaryEndPoint.Address
+          DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          DB_NAME: !Ref DatabaseName
+          DB_USER: postgres
+          DB_PASSWORD: your-secure-password # Replace with strong password
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - rds-data:ExecuteStatement
+                - elasticache:DescribeCacheClusters
+                - sqs:ReceiveMessage
+                - sqs:DeleteMessage
+              Resource: '*'
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ReconciliationQueue.Arn
+            BatchSize: 1
+      DeadLetterQueue:
+        Type: SQS
+        Properties:
+          Queue: !GetAtt DLQ.Arn
+
+  # SQS Queue
+  ReconciliationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 1800
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+        maxReceiveCount: 3
+
+  # Dead Letter Queue
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  # ElastiCache Redis
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      Engine: redis
+      CacheNodeType: !Ref RedisNodeType
+      NumCacheNodes: 1
+      Port: 6379
+
+  # Aurora Serverless
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineMode: serverless
+      DatabaseName: !Ref DatabaseName
+      MasterUsername: postgres
+      MasterUserPassword: your-secure-password # Replace with strong password
+      ScalingConfiguration:
+        MinCapacity: 2
+        MaxCapacity: 16
+        AutoPause: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 16
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/identify"
